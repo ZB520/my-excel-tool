@@ -245,3 +245,173 @@ async def process_winter_homework(request: Request):
     except Exception as e:
         traceback.print_exc()
         return {"error": f"处理出错: {str(e)}"}
+
+# ==========================================
+# 🚪 第三扇门：处理【西湖职高】格式 (最终版)
+# ==========================================
+@app.post("/process_westlake")
+async def process_westlake(request: Request):
+    # 1. 获取文件链接
+    data = await request.json()
+    file_url = data.get('file_url')
+    if not file_url:
+        return {"error": "请提供文件链接"}
+
+    try:
+        # 2. 下载文件
+        response = requests.get(file_url)
+        response.raise_for_status()
+        file_content = BytesIO(response.content)
+
+        # 3. 读取 Excel
+        df = pd.read_excel(file_content, sheet_name='Sheet1')
+
+        # === 核心处理逻辑 (您的最终版代码) ===
+
+        # 清理数据，重新设置列名
+        new_columns = ['序号', '教材名称', '出版社', '书号', '使用班级']
+        df_clean = df.copy()
+        
+        # 容错：确保列数足够
+        if len(df_clean.columns) >= 5:
+            df_clean = df_clean.iloc[:, :5]
+        df_clean.columns = new_columns
+
+        # 删除第一行
+        df_clean = df_clean.drop(0).reset_index(drop=True)
+
+        # 定义解析函数 (基于您的最终版逻辑)
+        def parse_class_info_new_format(class_str):
+            classes = []
+            s = str(class_str)
+            
+            # 先清理字符串，去掉括号和括号里的内容
+            cleaned_str = re.sub(r'（[^）]*）', '', s)  # 去掉中文括号内容
+            cleaned_str = re.sub(r'\([^)]*\)', '', cleaned_str)  # 去掉英文括号内容
+            cleaned_str = cleaned_str.strip(' 、，,')  # 去掉首尾的分隔符
+            
+            # 格式1：茶艺231-45 → 23茶艺1 (专业+年份班级-人数)
+            pattern1 = r'([\u4e00-\u9fa5]+)(\d{2})(\d+)(?:-(\d+))?'
+            matches1 = re.findall(pattern1, cleaned_str)
+            
+            # 格式2：电251-45 → 25电1 (专业+年份班级-人数)
+            pattern2 = r'([\u4e00-\u9fa5]*)(\d{2})(\d+)(?:-(\d+))?'
+            matches2 = re.findall(pattern2, cleaned_str)
+
+            # 处理格式1
+            for match in matches1:
+                major, year, class_num, count = match
+                class_name = f"{year}{major}{class_num}"
+                cnt = int(count) if count else None
+                classes.append((class_name, cnt))
+            
+            # 处理格式2 (如果格式1没匹配到，或者有混合情况)
+            # 注意：matches2 也会匹配到 matches1 的情况，所以需要去重或逻辑判断
+            # 但您的原代码是分开追加的，这里保持原逻辑
+            if not matches1: 
+                for match in matches2:
+                    major, year, class_num, count = match
+                    if not major: major = "电" # 默认专业
+                    
+                    class_name = f"{year}{major}{class_num}"
+                    
+                    # 避免重复添加 (因为 pattern2 包含了 pattern1 的部分特征)
+                    if not any(c[0] == class_name for c in classes):
+                        cnt = int(count) if count else None
+                        classes.append((class_name, cnt))
+            
+            # 格式3：纯数字 231-45 → 23电1
+            if not classes:
+                pattern3 = r'(\d{2})(\d+)(?:-(\d+))?'
+                matches3 = re.findall(pattern3, cleaned_str)
+                for match in matches3:
+                    year, class_num, count = match
+                    class_name = f"{year}电{class_num}"
+                    if not any(c[0] == class_name for c in classes):
+                        cnt = int(count) if count else None
+                        classes.append((class_name, cnt))
+
+            # 格式4：三位数字 251 → 25电1
+            if not classes:
+                pattern4 = r'(\d{3})(?:-(\d+))?'
+                matches4 = re.findall(pattern4, cleaned_str)
+                for match in matches4:
+                    full_num, count = match
+                    if len(full_num) == 3:
+                        year = full_num[:2]
+                        class_num = full_num[2:]
+                        class_name = f"{year}电{class_num}"
+                        if not any(c[0] == class_name for c in classes):
+                            cnt = int(count) if count else None
+                            classes.append((class_name, cnt))
+                            
+            return classes
+
+        # 定义排序函数
+        def get_class_sort_key(class_name):
+            # 匹配年份+专业+班号
+            match = re.search(r'^(\d{2})', str(class_name))
+            if match:
+                year = int(match.group(1))
+                class_num_match = re.search(r'(\d+)$', str(class_name))
+                if class_num_match:
+                    class_num = int(class_num_match.group(1))
+                    return year * 100 + class_num
+                return year * 100
+            return 999999
+
+        processed_data = []
+        for index, row in df_clean.iterrows():
+            textbook_name = row['教材名称']
+            publisher = row['出版社']
+            isbn = row['书号']
+            class_info = row['使用班级']
+            
+            if pd.isna(class_info) or str(class_info).strip() == '':
+                continue
+            
+            classes = parse_class_info_new_format(class_info)
+            
+            for class_name, student_count in classes:
+                processed_data.append({
+                    '教材名称': textbook_name,
+                    '出版社': publisher,
+                    '书号': isbn,
+                    '班级': class_name,
+                    '人数': student_count
+                })
+
+        result_df = pd.DataFrame(processed_data)
+        if result_df.empty:
+            return {"error": "未能解析出有效数据"}
+
+        # 排序
+        result_df['排序键'] = result_df['班级'].apply(get_class_sort_key)
+        result_df_sorted = result_df.sort_values('排序键', ascending=True)
+
+        # 去重
+        result_df_unique = result_df_sorted.drop_duplicates(subset=['班级', '教材名称', '出版社', '书号']).copy()
+
+        # 编号
+        unique_classes = result_df_unique['班级'].drop_duplicates().tolist()
+        class_map = {name: i for i, name in enumerate(unique_classes, 1)}
+        result_df_unique['编号'] = result_df_unique['班级'].map(class_map)
+
+        # 最终列顺序 (注意：您代码里去掉了排序键)
+        final_df = result_df_unique[['编号', '班级', '人数', '教材名称', '出版社', '书号']].reset_index(drop=True)
+
+        # === 保存文件 ===
+        filename = f"westlake_final_{uuid.uuid4()}.xlsx"
+        save_path = os.path.join("static", filename)
+        final_df.to_excel(save_path, index=False)
+
+        # 生成链接
+        base_url = str(request.base_url).rstrip("/")
+        download_url = f"{base_url}/static/{filename}"
+        if download_url.startswith("http://"):
+            download_url = download_url.replace("http://", "https://", 1)
+
+        return {"download_url": download_url, "message": "西湖职高(最终版)处理完成"}
+
+    except Exception as e:
+        return {"error": f"处理出错: {str(e)}"}
